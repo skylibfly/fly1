@@ -1,0 +1,864 @@
+using System;
+using Ats.Core;
+
+namespace StrategyBox
+{
+  
+    //作为外汇市场上广为流行的一种突破交易策略，HANS123以其简洁的开盘后N根K线的高低点突破
+    //作为交易信号触发的评判标准。这也是一种入场较早的交易模式，配合适当过滤技术，或可提高其胜算。
+
+    public class Hans123 : Strategy
+    {
+        #region 参数
+
+        [Parameter(Display = "Qty", Description = "每次开仓手数", Category = "资金管理")]
+        public int Qty = 1;
+
+        [Parameter(Display = "开盘观察区间", Description = "开盘观察区间", Category = "时间框架")]
+        public double 开盘观察区间 = 100;
+
+        [Parameter(Display = "收盘秒", Description = "", Category = "平仓")]
+        public double 收盘秒 = 120;
+
+        [Parameter(Display = "是否输出状态", Description = "", Category = "其他")]
+        public bool 是否输出状态 = true;
+
+        #endregion
+
+        #region 变量
+        /// <summary>
+        /// 状态机
+        /// </summary>
+        StateMachine 状态机 = new StateMachine();
+
+        /// <summary>
+        /// 开盘时间
+        /// </summary>
+        DateTime tOpen = default(DateTime);
+
+        /// <summary>
+        /// 收盘时间
+        /// </summary>
+        DateTime tClose = default(DateTime);
+
+        /// <summary>
+        /// 清仓时间
+        /// </summary>
+        DateTime tFinish = default(DateTime);
+
+        /// <summary>
+        /// 停止开仓时间
+        /// </summary>
+        DateTime tStop = default(DateTime);
+
+        /// <summary>
+        /// 价格乘数
+        /// </summary>
+        double VolumeMultiple = 300;
+
+        double PriceTick = 0.2;
+
+        /// <summary>
+        /// 最新Tick的时间戳
+        /// </summary>
+        DateTime TickNow = DateTime.Now;
+
+        /// <summary>
+        /// 平仓跳
+        /// </summary>
+        public int PCJP = 3;
+
+        /// <summary>
+        /// 开仓跳
+        /// </summary>
+        public int KCJP = 3;
+
+        /// <summary>
+        /// 开仓单10秒不成就撤单
+        /// </summary>
+        double KCBC = 10;
+
+        /// <summary>
+        /// 平仓单5秒不成就撤单
+        /// </summary>
+        double PCBC = 5;
+
+
+        double 向上突破线 = 0;
+
+        double 向下突破线 = 0;
+
+        double LastPrice = 0;
+
+        DateTime 截断时间;
+
+        bool 经过截断时间 = false;
+
+        /// <summary>
+        /// 中午休息开始时间
+        /// </summary>
+        DateTime RestT0
+        {
+            get
+            {
+                return new DateTime(Year, Month, Day, 11, 30, 0);
+            }
+        }
+
+        /// <summary>
+        /// 下午开盘时间
+        /// </summary>
+        DateTime RestT1
+        {
+            get
+            {
+                return new DateTime(Year, Month, Day, 13, 0, 0);
+            }
+        }
+
+        /// <summary>
+        /// 计数器
+        /// </summary>
+        int clc = 0;
+
+        /// <summary>
+        /// 输出文件
+        /// </summary>
+        OutFileHelper outfile;
+
+        #endregion
+
+        #region 策略事件
+
+        /// <summary>
+        /// 启动策略
+        /// </summary>
+        public override void Init()
+        {
+            #region
+            Print("演示策略主要用于技术测试，主要用于复盘或者模拟测试");
+            Print("默认品种" + DefaultFutureCode);
+            GetFutureAccount();
+            Exchange exch = GetExchange(DefaultFuture.ExchangeID);
+            Print("交易所是" + exch.ExchangeEnum.ToString());
+            tOpen = GetExchangeOpenTime(exch.ExchangeEnum);
+            tClose = GetExchangeCloseTime(exch.ExchangeEnum);
+            tFinish = tClose.AddSeconds(-收盘秒);
+            tStop = tClose.AddSeconds(-2 * 收盘秒);
+
+            截断时间 = tOpen.AddMinutes(开盘观察区间);
+            Print("截断时间=" + 截断时间.ToString());
+
+            Print("开盘时间=" + tOpen.ToString());
+            Print("收盘时间=" + tClose.ToString());
+            Print("清仓时间=" + tFinish.ToString());
+            Print("停止开仓时间=" + tStop.ToString());
+
+            PriceTick = DefaultFuture.PriceTick;
+
+            VolumeMultiple = DefaultFuture.VolumeMultiple;
+
+            向上突破线 = -10000;
+            向下突破线 = 10000;
+
+            Print("初始化成功,！！！！" + Now.ToString());
+            #endregion
+
+            if (是否输出状态)
+            {
+                //指定好输出文件
+                string fileName = "c:\\Out\\" + Now.ToString("yyyyMMdd") + ".csv";
+                outfile = new OutFileHelper(fileName);
+                outfile.AddColumn("时间");
+                outfile.AddColumn("价格");
+                outfile.AddColumn("状态");
+                outfile.Init();
+            }
+         
+        }
+
+        /// <summary>
+        /// Tick触发
+        /// </summary>
+        /// <param name="tick"></param>
+        public override void OnTick(Tick tick)
+        {
+            clc++;
+
+            if (clc > 100)
+            {
+                clc = 0;
+            }
+
+            TickNow = tick.DateTime;
+            LastPrice = tick.LastPrice;
+            if (TickNow < tOpen)
+            {
+                //过滤集合竞价期间的Tick
+                return;
+            }
+
+            #region 核心触发
+            try
+            {
+
+                #region
+
+
+                追单();
+
+                #region 坏点过滤
+                if (
+  tick.AskPrice1 <= 0 ||
+  tick.AskVolume1 <= 0 ||
+  tick.BidPrice1 <= 0 ||
+  tick.BidVolume1 <= 0 ||
+  tick.AskPrice1 > 1000000 ||
+  tick.AskVolume1 > 1000000 ||
+  tick.BidPrice1 > 1000000 ||
+  tick.BidVolume1 > 1000000)
+                {
+                    return;
+                }
+                #endregion
+
+
+                if (TickNow <= 截断时间)
+                {
+                    #region 如果在截断区间内，则更新高低点
+                    向上突破线 = Math.Max(向上突破线, LastPrice);
+                    向下突破线 = Math.Min(向下突破线, LastPrice);
+                    #endregion
+                }
+                else
+                {
+                    if (!经过截断时间)
+                    {
+                        经过截断时间 = true;
+                        Print("刚刚经过阶段时间,向上突破线=" + 向上突破线 + ",向下突破线=" + 向下突破线);
+                    }
+
+                    //如果发现上下轨价格不正常，说明实盘启动策略的时间晚于截断时间,内存中没有正确的上下突破线，则不交易
+                    if (向上突破线 < 0 || 向上突破线 < 向下突破线)
+                    {
+                        Print("初始化数据异常:向上突破线=" + 向上突破线 + ",向下突破线=" + 向下突破线);
+                    }
+                    else
+                    {
+                        #region 过了截断时间以后，进行交易
+                        状态机.TargetFlag = 计算策略目标状态位(tick);
+
+                        核心交易处理();
+                        #endregion
+                    }
+                }
+
+                if (是否输出状态 && clc % 10 == 0)
+                {
+                    //输出状态佳
+                    Print( "@"+TickNow.ToString()+"策略当前状态=" + 状态机.ToString());
+                    //这里输出时间、价格、状态
+                    string str = TickNow.ToString() + "," + tick.LastPrice + "," + 状态机.Flag +",";
+                    outfile.AddRow(str);
+                    outfile.Enter();
+                }
+
+                #endregion
+            }
+            catch (Exception ex)
+            {
+                Print("策略OnTick时出现异常！！！！" + ex.Message + "|" + ex.Source);
+            }
+            #endregion
+        }
+
+        public override void Exit()
+        {
+            if (是否输出状态  )
+            {
+                outfile.Write();
+            }
+        }
+
+        public void 核心交易处理()
+        {
+            //注意：只要目标Flag!=实际Flag
+            //这个时候要看Flag                   
+            if (状态机.Flag != 状态机.TargetFlag && !状态机.IsDoing)
+            {
+                #region
+                状态机.IsDoing = true;//正在操作
+                string info = "";
+                //绝对工作量
+                int AbsWork = Abs(状态机.TargetFlag - 状态机.Flag);
+                if (状态机.TargetFlag == 0)
+                {
+                    #region 把Old的全部平掉
+                    if (状态机.Flag > 0)
+                    {
+                        info += "目标仓单=0,平全部初始多单,";
+                        状态机.KN = 0;
+                        状态机.KN_Trd = 0;
+                        状态机.PN = AbsWork;
+                        状态机.PN_Trd = 0;
+                        显示当前状态("触发平多单");
+                        SafeOrder(PCJP,
+                            DefaultFutureCode,
+                            AbsWork,
+                            EnumBuySell.卖出,
+                            EnumOpenClose.平今仓);
+                    }
+                    else if (状态机.Flag < 0)
+                    {
+                        info += "目标理论仓单=0,平全部初始空单,";
+                        if (状态机.KN_Trd > 0)
+                        {
+                            状态机.KN = 0;
+                            状态机.KN_Trd = 0;
+                            状态机.PN = AbsWork;
+                            状态机.PN_Trd = 0;
+                            显示当前状态("触发平空单");
+                            SafeOrder(PCJP,
+                                DefaultFutureCode,
+                                AbsWork,
+                                EnumBuySell.买入,
+                                EnumOpenClose.平今仓);
+                        }
+                    }
+                    #endregion
+                }
+                else
+                {
+                    #region 目标位有持仓
+                    if (状态机.Flag == 0)
+                    {
+                        #region 如果当前不持仓，那么直接开
+                        if (状态机.TargetFlag > 0)
+                        {
+                            info += "初始理论仓单=0,直接开目标多单,";
+                            状态机.KN = AbsWork;
+                            状态机.KN_Trd = 0;
+                            状态机.PN = 0;
+                            状态机.PN_Trd = 0;
+                            显示当前状态("触发开仓做多");
+                            SafeOrder(KCJP,
+                                DefaultFutureCode,
+                                AbsWork,
+                                       EnumBuySell.买入,
+                                       EnumOpenClose.开仓);
+                        }
+                        else if (状态机.TargetFlag < 0)
+                        {
+                            info += "初始理论仓单=0,直接开目标空单,";
+                            状态机.KN = AbsWork;
+                            状态机.KN_Trd = 0;
+                            状态机.PN = 0;
+                            状态机.PN_Trd = 0;
+                            显示当前状态("触发开仓做空");
+                            SafeOrder(KCJP, DefaultFutureCode, AbsWork,
+                                       EnumBuySell.卖出, EnumOpenClose.开仓);
+                        }
+                        #endregion
+                    }
+                    else
+                    {
+                        #region New理论仓单 Old理论仓单 都不为0
+                        if (状态机.TargetFlag * 状态机.Flag > 0)
+                        {
+                            #region 同向
+                            if (Abs(状态机.TargetFlag) > Abs(状态机.Flag))
+                            {
+                                #region 同向增仓   新开仓
+                                if (状态机.TargetFlag > 0)
+                                {
+                                    info += "同向,目标理论仓单>初始理论仓单,同向增仓做多,";
+                                    //目标开仓位在原有基础上增加!
+                                    状态机.KN = 状态机.KN + AbsWork;
+                                    状态机.KN_Trd = 状态机.KN_Trd + 0;
+                                    状态机.PN = 0;
+                                    状态机.PN_Trd = 0;
+                                    显示当前状态("触发增仓做多");
+                                    SafeOrder(KCJP,
+                                        DefaultFutureCode,
+                                        AbsWork,
+                                        EnumBuySell.买入,
+                                        EnumOpenClose.开仓);
+                                }
+                                else if (状态机.TargetFlag < 0)
+                                {
+                                    info += "同向,目标理论仓单>初始理论仓单,同向增仓做空,";
+                                    //目标开仓位在原有基础上增加!
+                                    状态机.KN = 状态机.KN + AbsWork;
+                                    状态机.KN_Trd = 状态机.KN_Trd + 0;
+                                    状态机.PN = 0;
+                                    状态机.PN_Trd = 0;
+                                    显示当前状态("触发增仓做空");
+                                    SafeOrder(KCJP, DefaultFutureCode, AbsWork,
+                                               EnumBuySell.卖出, EnumOpenClose.开仓);
+                                }
+                                #endregion
+                            }
+                            else if (Abs(状态机.TargetFlag) < Abs(状态机.Flag))
+                            {
+                                #region 同向减仓 （平掉部分单子）
+                                if (状态机.TargetFlag > 0)
+                                {
+                                    info += "反向,目标理论仓单<初始理论仓单,减仓做空,";
+                                    //这里注意把KN降下来
+                                    状态机.KN = 状态机.KN - AbsWork;
+                                    状态机.KN_Trd = 状态机.KN_Trd - AbsWork;
+                                    状态机.PN = AbsWork;
+                                    状态机.PN_Trd = 0;
+                                    显示当前状态("触发减仓做空");
+                                    SafeOrder(PCJP, DefaultFutureCode,
+                                        AbsWork,
+                                        EnumBuySell.卖出,
+                                        EnumOpenClose.平今仓);
+                                }
+                                else if (状态机.TargetFlag < 0)
+                                {
+                                    info += "反向,目标理论仓单<初始理论仓单,减仓做多,";
+                                    //这里注意把KN降下来
+                                    状态机.KN = 状态机.KN - AbsWork;
+                                    状态机.KN_Trd = 状态机.KN_Trd - AbsWork;
+                                    状态机.PN = AbsWork;
+                                    状态机.PN_Trd = 0;
+                                    显示当前状态("触发减仓做多");
+                                    SafeOrder(PCJP,
+                                        DefaultFutureCode,
+                                        AbsWork,
+                                        EnumBuySell.买入,
+                                        EnumOpenClose.平今仓);
+                                }
+                                #endregion
+                            }
+                            #endregion
+                        }
+                        else
+                        {
+                            #region 方向，有一个先平后开的问题，这里要非常精细！！
+                            if (状态机.Flag > 0)
+                            {
+                                //先打平仓单，只有等平仓单全部成交了，才开仓！！
+                                info += "反向,多单全平,开目标空单,";
+                                状态机.KN = Abs(状态机.TargetFlag);
+                                状态机.KN_Trd = 0;
+                                状态机.PN = Abs(状态机.Flag);
+                                状态机.PN_Trd = 0;
+                                显示当前状态("触发先平后开做空");
+                                //把多单全平了
+                                //然后开目标空单                                       
+                                SafeOrder(PCJP,
+                                    DefaultFutureCode,
+                                    状态机.PN,
+                                    EnumBuySell.卖出,
+                                    EnumOpenClose.平今仓);
+                            }
+                            else if (状态机.Flag < 0)
+                            {
+                                //先打平仓单，只有等平仓单全部成交了，才开仓！！
+                                info += "反向,空单全平,开目标多单,";
+                                状态机.KN = Abs(状态机.TargetFlag);
+                                状态机.KN_Trd = 0;
+                                状态机.PN = Abs(状态机.Flag);
+                                状态机.PN_Trd = 0;
+                                显示当前状态("触发先平后开做多");
+                                SafeOrder(PCJP,
+                                    DefaultFutureCode,
+                                    状态机.PN,
+                                    EnumBuySell.买入,
+                                    EnumOpenClose.平今仓);
+                            }
+                            #endregion
+                        }
+                        #endregion
+                    }
+                    #endregion
+                }
+                状态机.Flag = 状态机.TargetFlag;//最终标志位强制设置成目标标志位!!
+                Print(info);
+                #endregion
+            }
+        }
+
+        /// <summary>
+        /// 成交回报
+        /// </summary>
+        /// <param name="trade"></param>
+        public override void OnTrade(Trade trade)
+        {
+            #region
+
+            string ordID = trade.OrderSysID;
+
+            //肯定是先平后开
+            if (trade.OpenOrClose == EnumOpenClose.开仓)
+            {
+                状态机.KN_Trd += trade.Volume;
+                if (状态机.KN_Trd >= 状态机.KN)
+                {
+                    if (状态机.PN_Trd >= 状态机.PN)
+                    {
+                        状态机.IsDoing = false;
+                        显示当前状态("开仓完成,逻辑结束");
+                    }
+                    else
+                    {
+                        显示当前状态("开仓完成,但还有平仓任务没完成");
+                    }
+                }
+            }
+            else
+            {
+                #region
+                状态机.PN_Trd += trade.Volume;
+
+                if (状态机.PN_Trd >= 状态机.PN)
+                {
+                    显示当前状态("平仓动作完成");
+                    if (状态机.KN == 0)
+                    {
+                        Print("没有开仓任务，逻辑结束");
+                        状态机.IsDoing = false;
+                    }
+                    else
+                    {
+                        if (状态机.KN_Trd >= 状态机.KN)
+                        {
+                            Print("开仓任务全部完成,KN_Trd=" + 状态机.KN_Trd + ",KN=" + 状态机.KN + "，逻辑结束");
+                            状态机.IsDoing = false;
+                        }
+                        else
+                        {
+                            //把开仓的任务做出来
+                            Print("KN=" + 状态机.KN + ",KN_Trd=" + 状态机.KN_Trd + "需要执行开仓任务");
+                            int K_Vol = 状态机.KN - 状态机.KN_Trd;
+                            Print("实际开仓量=" + K_Vol);
+                            SafeOrder(KCJP, trade.InstrumentID, K_Vol, trade.Direction, EnumOpenClose.开仓);
+                        }
+                    }
+                }
+                #endregion
+            }
+            Print("###成交回报" + trade.ToString());
+            #endregion
+        }
+
+
+        /// <summary>
+        /// 委托拒绝
+        /// </summary>
+        /// <param name="order"></param>
+        public override void OnOrderRejected(Order order)
+        {
+            Print("委托被拒绝!!!理由:" + order.OrderRejectReason.ToString());
+            Print(order.ToString());
+
+            if (order.OpenOrClose == EnumOpenClose.开仓)
+            {
+                Print("开仓被拒绝，放弃开仓");
+                return;
+            }
+            else
+            {
+                //如果是平今仓位不足---则不用再平否则会死循环
+                if (order.OrderRejectReason == EnumRejectReason.平今仓位不足 ||
+                    order.OrderRejectReason == EnumRejectReason.平昨仓位不足)
+                {
+                    Print("平仓仓位不足，不做任何处理");
+                }
+                else
+                {
+                    ResendOrder(order, 2);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 撤单成功
+        /// </summary>
+        /// <param name="order"></param>
+        public override void OnOrderCanceled(Order order)
+        {
+            Print("撤单回报" + order.ToString());
+            if (order.OpenOrClose == EnumOpenClose.开仓)
+            {
+                //开仓被撤单，追单开仓
+                ResendOrder(order, 2);
+            }
+            else
+            {
+                //撤单时按照2
+                ResendOrder(order, 2);
+            }
+        }
+
+        #endregion
+
+        #region 辅助
+
+        #region 日线处理
+
+        public double 计算前N天的高点(BarSeries kline, int backn)
+        {
+            int CountKline = kline.Count;
+            if (是否包含今天的日线(kline))
+            {
+                return kline.HighestHigh(CountKline - 1 - backn, CountKline - 1 - 1);
+            }
+            else
+            {
+                return kline.HighestHigh(CountKline - backn, CountKline - 1);
+            }
+        }
+
+        public double 计算前N天的低点(BarSeries kline, int backn)
+        {
+            int CountKline = kline.Count;
+            if (是否包含今天的日线(kline))
+            {
+                return kline.LowestLow(CountKline - 1 - backn, CountKline - 1 - 1);
+            }
+            else
+            {
+                return kline.LowestLow(CountKline - backn, CountKline - 1);
+            }
+        }
+
+        public bool 是否包含今天的日线(BarSeries kline)
+        {
+            return (kline.Last.EndTime.Year == Year
+                && kline.Last.EndTime.Month == Month
+                && kline.Last.EndTime.Day == Day);
+        }
+        #endregion
+
+        /// <summary>
+        /// 如果开仓失败，说明资金被占用了，回滚状态机
+        /// </summary>
+        public void RollBackK()
+        {
+            显示当前状态("开仓失败，回滚之前:");
+            状态机.清空();
+            显示当前状态("开仓失败，回滚之后:");
+        }
+
+
+
+        public void 追单()
+        {
+            #region 追单
+            string 订阅品种 = AllFutures[0].ID;//确保只撤本工程订阅的品种的委托
+            OrderSeries cancelLst = GetCanCancelFutureOrders();
+            if (cancelLst != null && cancelLst.Count > 0)
+            {
+                //注意开仓单也追
+                Print("可撤单列表行数=" + cancelLst.Count);
+                foreach (Order order in cancelLst)
+                {
+                    if (order.InstrumentID == 订阅品种)
+                    {
+                        Print("可撤单委托ID=" + order.OrderSysID);
+                        double Dt = (TickNow - order.InsertTime).TotalSeconds;
+                        //注意考虑中午休息时间
+                        if (TickNow >= RestT1 && order.InsertTime <= RestT0)
+                        {
+                            Dt = Dt - (RestT1 - RestT0).TotalSeconds;
+                        }
+
+                        if (order.OpenOrClose == EnumOpenClose.开仓)
+                        {
+                            if (Dt > KCBC && order.OrderSysID != "")
+                            {
+                                CancelFutureOrder(order);
+                            }
+                        }
+                        else
+                        {
+                            if (Dt > PCBC && order.OrderSysID != "")
+                            {
+                                CancelFutureOrder(order);
+                            }
+                        }
+                    } 
+                }
+            }
+            #endregion
+        }
+
+        /// <summary>
+        /// 显示策略核心状态位
+        /// </summary>
+        public void 显示当前状态(string info)
+        {
+            //显示核心信息 
+            Print(info);
+            Print(状态机.ToString());
+        }
+
+        public int 计算策略目标状态位(Tick tick)
+        {
+            #region 获取策略当前信号
+            //策略分为3个阶段：正常开仓，不开仓，收盘清仓
+            int 计算信号 = 计算策略模块信号(tick);
+            int 返回信号 = 0;
+            if (tStop < TickNow && TickNow < tFinish)
+            {
+                //这段时间不开新仓，只平仓，保持策略持仓
+                if (计算信号 == 0 || 计算信号 * 状态机.Flag < 0)
+                {
+                    //如果策略需要平仓或者反向，则直接平仓 
+                    返回信号 = 0;
+                }
+                else
+                {
+                    //如果策略主动要求减仓，则可以平仓
+                    if (计算信号 * 状态机.Flag > 0 && Abs(计算信号) < Abs(状态机.Flag))
+                    {
+                        返回信号 = 计算信号;
+                    }
+                    else
+                    {
+                        返回信号 = 状态机.Flag;
+                    }
+
+                }
+            }
+            else if (tFinish < TickNow)
+            {
+                //收盘清理时间
+                返回信号 = 0;
+            }
+            else
+            {
+                if (tStop < TickNow)
+                {
+                    返回信号 = 0;
+                }
+                else
+                {
+                    返回信号 = 计算信号;
+                }
+
+            }
+            return 返回信号;
+            #endregion
+        }
+
+
+        /// <summary>
+        /// 计算当前策略的持仓量 3表示3张多单，-2表示2张空单
+        /// 模拟策略信号
+        /// </summary>
+        /// <param name="tick"></param>
+        /// <returns></returns>
+        public int 计算策略模块信号(Tick tick)
+        {
+            
+            if (LastPrice >= 向上突破线)
+            {
+                return  Qty;
+            }
+            else if (LastPrice <= 向下突破线)
+            {
+                return -Qty;
+            }
+            else
+            {
+                return 状态机.TargetFlag;
+            }
+        }
+ 
+
+        /// <summary>
+        /// 重发委托
+        /// </summary>
+        /// <param name="order"></param>
+        /// <param name="jump"></param>
+        /// <returns></returns>
+        public Order ResendOrder(Order order, int jump)
+        {
+            Print("重发委托" + order.ToString());
+            if (order.VolumeLeft > 0)
+            {
+                Order neworder = SafeOrder(jump, order.InstrumentID, order.VolumeLeft,
+                    order.Direction, order.OpenOrClose);
+                return neworder;
+            }
+            else
+            {
+                Print("委托剩余量为0，不需要重发:" + order.ToString());
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 保守下单，在盘口浮动跳打单
+        /// </summary>
+        /// <param name="jump"></param>
+        /// <param name="InsID"></param>
+        /// <param name="Qty"></param>
+        /// <param name="direction"></param>
+        /// <param name="oc"></param>
+        /// <returns></returns>
+        Order SafeOrder(int jump, string InsID, int Qty, EnumBuySell direction, EnumOpenClose oc)
+        {
+            if (Qty > 0)
+            {
+                #region 保守发单
+                Tick tick = LastFutureTick(InsID);
+                double ordPrice = tick.LastPrice;
+                if (direction == EnumBuySell.买入)
+                {
+                    ordPrice = tick.BidPrice1 + jump * PriceTick;
+                }
+                else
+                {
+                    ordPrice = tick.AskPrice1 - jump * PriceTick;
+                }
+                ordPrice = TrimFuturePrice(DefaultFuture, ordPrice);
+
+                Print("安全下单" + Qty + "手" + oc.ToString() + direction.ToString() + InsID
+                    + "@" + ordPrice.ToString() + ",t=" + TickNow.ToString());
+                return LimitOrder(InsID, Qty, ordPrice, direction, oc);
+                #endregion
+            }
+            else
+            {
+                Print("下单量=" + Qty);
+                return null;
+            }
+        }
+
+        public override void OnCancelOrderFailed(Order order, string msg)
+        {
+            Print("撤单失败原因=" + msg);
+        }
+
+        /// <summary>
+        /// 保守撤单（如果委托没有ID或者已经成交，则不撤单）
+        /// </summary>
+        /// <param name="order"></param>
+        void SafeCancelOrder(Order order)
+        {
+            if (order.OrderSysID != "")
+            {
+                if (order.Volume > 0)
+                {
+                    Print("执行撤单");
+                    CancelFutureOrder(order);
+                }
+                else
+                {
+                    Print("委托量=0，不需要撤单");
+                }
+
+            }
+            else
+            {
+                Print("委托ID为空，不能撤单:" + order.ToString());
+            }
+        }
+        #endregion
+    }
+}
